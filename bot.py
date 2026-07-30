@@ -1,5 +1,6 @@
 import logging
 import os
+import re
 from html import escape
 
 from dotenv import load_dotenv
@@ -24,13 +25,14 @@ from database import (
     add_job,
     apply_to_job,
     approve_job,
-    get_approved_jobs,
+    get_approved_jobs_by_category,
     get_job,
     get_pending_jobs,
     get_user,
     init_db,
     reject_job,
     save_user,
+    set_job_plan,
     stats,
 )
 
@@ -48,6 +50,12 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+CATEGORIES = [
+    "🏥 Эрүүл мэнд", "☕ Үйлчилгээ", "🚗 Жолооч", "🏗 Барилга",
+    "💻 IT", "📊 Оффис", "🛒 Худалдаа", "🍔 Ресторан",
+    "🏭 Үйлдвэр", "📦 Ложистик", "🎓 Боловсрол", "🔧 Инженер",
+]
+
 (
     PROFILE_NAME,
     PROFILE_PHONE,
@@ -56,10 +64,11 @@ logger = logging.getLogger(__name__)
     PROFILE_SALARY,
     JOB_COMPANY,
     JOB_TITLE,
+    JOB_CATEGORY,
     JOB_SALARY,
     JOB_LOCATION,
     JOB_DESCRIPTION,
-) = range(10)
+) = range(11)
 
 MAIN_MENU = ReplyKeyboardMarkup(
     [
@@ -70,27 +79,48 @@ MAIN_MENU = ReplyKeyboardMarkup(
     resize_keyboard=True,
 )
 
+CATEGORY_MENU = ReplyKeyboardMarkup(
+    [
+        [CATEGORIES[0], CATEGORIES[1]], [CATEGORIES[2], CATEGORIES[3]],
+        [CATEGORIES[4], CATEGORIES[5]], [CATEGORIES[6], CATEGORIES[7]],
+        [CATEGORIES[8], CATEGORIES[9]], [CATEGORIES[10], CATEGORIES[11]],
+        ["🔙 Үндсэн цэс"],
+    ], resize_keyboard=True,
+)
+
 
 def job_text(job) -> str:
+    plan = job["plan"] if "plan" in job.keys() else "free"
+    badge = "👑 <b>VIP ЗАР</b>\n\n" if plan == "vip" else ("⭐ <b>PREMIUM ЗАР</b>\n\n" if plan == "premium" else "")
+    category = job["category"] or "📂 Бусад"
     return (
-        f"💼 <b>{escape(job['title']).upper()}</b>\n\n"
-        f"🏢 Компани: {escape(job['company'])}\n"
-        f"💰 Цалин: {escape(job['salary'])}\n"
-        f"📍 Байршил: {escape(job['location'])}\n"
-        f"🕐 Ажлын төрөл: Бүтэн цаг\n\n"
+        f"{badge}💼 <b>{escape(job['title']).upper()}</b>\n\n"
+        f"🏢 <b>{escape(job['company'])}</b>\n"
+        f"📂 {escape(category)}\n"
+        f"📍 {escape(job['location'])}\n"
+        f"💰 <b>{escape(job['salary'])}</b>\n"
+        f"🕐 Бүтэн цаг\n\n"
         f"━━━━━━━━━━━━━━━━━━\n\n"
-        f"📋 <b>Шаардлага</b>\n"
+        f"📌 <b>ТАВИГДАХ ШААРДЛАГА</b>\n\n"
         f"{escape(job['description'])}\n\n"
         f"━━━━━━━━━━━━━━━━━━\n\n"
-        f"🆔 Зарын дугаар: #{job['id']}\n\n"
-        f"👇 Доорх товчоор анкетаа илгээнэ үү."
+        f"🟢 Идэвхтэй зар\n🆔 Зарын дугаар: #{job['id']}"
     )
+
+def admin_review_buttons(job_id):
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Энгийн", callback_data=f"approve_free:{job_id}"),
+         InlineKeyboardButton("⭐ Premium 7 хоног", callback_data=f"approve_premium:{job_id}")],
+        [InlineKeyboardButton("👑 VIP 30 хоног", callback_data=f"approve_vip:{job_id}"),
+         InlineKeyboardButton("❌ Татгалзах", callback_data=f"reject:{job_id}")],
+    ])
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
-        "Сайн байна уу! 👋\n\n"
-        "Ажил хайгч болон ажил олгогчийг холбох ботод тавтай морил.",
+        "🇲🇳 <b>MONGOL JOB</b>\n\n"
+        "Ажил хайгч болон ажил олгогчийг холбох ухаалаг платформд тавтай морил. 👋",
+        parse_mode=ParseMode.HTML,
         reply_markup=MAIN_MENU,
     )
 
@@ -165,7 +195,18 @@ async def job_company(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
 
 async def job_title(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data["title"] = update.message.text.strip()
-    await update.message.reply_text("Цалин:")
+    await update.message.reply_text("📂 Ангиллаа сонгоно уу:", reply_markup=CATEGORY_MENU)
+    return JOB_CATEGORY
+
+async def job_category(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    selected = update.message.text.strip()
+    if selected == "🔙 Үндсэн цэс":
+        return await cancel(update, context)
+    if selected not in CATEGORIES:
+        await update.message.reply_text("Доорх товчнуудаас ангиллаа сонгоно уу.", reply_markup=CATEGORY_MENU)
+        return JOB_CATEGORY
+    context.user_data["category"] = selected
+    await update.message.reply_text("💰 Цалин:")
     return JOB_SALARY
 
 
@@ -197,12 +238,7 @@ async def job_description(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     )
 
     if ADMIN_ID and job:
-        keyboard = InlineKeyboardMarkup(
-            [[
-                InlineKeyboardButton("✅ Батлах", callback_data=f"approve:{job_id}"),
-                InlineKeyboardButton("❌ Татгалзах", callback_data=f"reject:{job_id}"),
-            ]]
-        )
+        keyboard = admin_review_buttons(job_id)
         try:
             await context.bot.send_message(
                 chat_id=ADMIN_ID,
@@ -217,39 +253,23 @@ async def job_description(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 
 async def browse_jobs(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    jobs = get_approved_jobs()
+    await update.message.reply_text(
+        "📂 <b>АЖЛЫН АНГИЛАЛ</b>\n\nСонирхсон салбараа сонгоно уу 👇",
+        parse_mode=ParseMode.HTML, reply_markup=CATEGORY_MENU,
+    )
 
+async def category_jobs(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    category = update.message.text.strip()
+    jobs = get_approved_jobs_by_category(category)
     if not jobs:
-        await update.message.reply_text("Одоогоор батлагдсан ажлын зар алга.")
+        await update.message.reply_text(f"{category} ангилалд одоогоор зар алга.", reply_markup=CATEGORY_MENU)
         return
-
+    await update.message.reply_text(f"{category} — {len(jobs)} зар олдлоо.", reply_markup=CATEGORY_MENU)
     for job in jobs:
-        keyboard = InlineKeyboardMarkup(
-            [
-                [
-                    InlineKeyboardButton(
-                        "📨 Анкет илгээх",
-                        callback_data=f"apply:{job['id']}",
-                    )
-                ],
-                [
-                    InlineKeyboardButton(
-                        "ℹ️ Дэлгэрэнгүй",
-                        callback_data=f"detail:{job['id']}",
-                    ),
-                    InlineKeyboardButton(
-                        "⭐ Хадгалах",
-                        callback_data=f"save:{job['id']}",
-                    ),
-                ],
-            ]
-        )
-
-        await update.message.reply_text(
-            job_text(job),
-            parse_mode=ParseMode.HTML,
-            reply_markup=keyboard,
-        )
+        keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("📨 Анкет илгээх", callback_data=f"apply:{job['id']}")],
+            [InlineKeyboardButton("ℹ️ Дэлгэрэнгүй", callback_data=f"detail:{job['id']}"),
+             InlineKeyboardButton("⭐ Хадгалах", callback_data=f"save:{job['id']}")]])
+        await update.message.reply_text(job_text(job), parse_mode=ParseMode.HTML, reply_markup=keyboard)
 
 
 async def apply_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -323,43 +343,48 @@ async def save_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 async def admin_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
-
     if query.from_user.id != ADMIN_ID:
-        await query.answer("Танд админы эрх байхгүй.", show_alert=True)
-        return
-
-    action, raw_id = query.data.split(":")
-    job_id = int(raw_id)
-    job = get_job(job_id)
-
+        await query.answer("Танд админы эрх байхгүй.", show_alert=True); return
+    action, raw_id = query.data.rsplit(":", 1); job_id = int(raw_id); job = get_job(job_id)
     if not job:
-        await query.answer("Зар олдсонгүй.", show_alert=True)
-        return
-
-    if action == "approve":
-        changed = approve_job(job_id)
-        status_text = "✅ Батлагдсан"
-        employer_message = f"✅ Таны #{job_id} дугаартай ажлын зар батлагдлаа."
+        await query.answer("Зар олдсонгүй.", show_alert=True); return
+    if action == "approve_free":
+        changed = approve_job(job_id, "free"); status_text="✅ Энгийн зар"; msg=f"✅ Таны #{job_id} зар батлагдлаа."
+    elif action == "approve_premium":
+        changed = approve_job(job_id, "premium", 7); status_text="⭐ Premium 7 хоног"; msg=f"⭐ Таны #{job_id} зар Premium эрхтэйгээр 7 хоног нийтлэгдлээ."
+    elif action == "approve_vip":
+        changed = approve_job(job_id, "vip", 30); status_text="👑 VIP 30 хоног"; msg=f"👑 Таны #{job_id} зар VIP эрхтэйгээр 30 хоног нийтлэгдлээ."
     else:
-        changed = reject_job(job_id)
-        status_text = "❌ Татгалзсан"
-        employer_message = f"❌ Таны #{job_id} дугаартай ажлын зар татгалзагдлаа."
-
+        changed = reject_job(job_id); status_text="❌ Татгалзсан"; msg=f"❌ Таны #{job_id} зар татгалзагдлаа."
     if not changed:
-        await query.answer(
-            "Энэ зар өмнө нь шийдвэрлэгдсэн байна.",
-            show_alert=True,
-        )
-        return
-
+        await query.answer("Энэ зар өмнө нь шийдвэрлэгдсэн байна.", show_alert=True); return
     await query.edit_message_reply_markup(reply_markup=None)
     await query.message.reply_text(f"{status_text}: зар #{job_id}")
     await query.answer()
+    try: await context.bot.send_message(job["employer_id"], msg)
+    except Exception: logger.exception("Ажил олгогчид шийдвэр хүрсэнгүй")
 
-    try:
-        await context.bot.send_message(job["employer_id"], employer_message)
-    except Exception:
-        logger.exception("Ажил олгогчид шийдвэр хүрсэнгүй")
+async def premium_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.effective_user.id != ADMIN_ID: return
+    if not context.args or not context.args[0].isdigit():
+        await update.message.reply_text("Ашиглах: /premium 25"); return
+    job_id=int(context.args[0]); job=get_job(job_id)
+    if not job or job["status"] != "approved":
+        await update.message.reply_text("Батлагдсан зар олдсонгүй."); return
+    kb=InlineKeyboardMarkup([[InlineKeyboardButton("✅ Энгийн", callback_data=f"plan_free:{job_id}"),
+        InlineKeyboardButton("⭐ Premium 7 хоног", callback_data=f"plan_premium:{job_id}")],
+        [InlineKeyboardButton("👑 VIP 30 хоног", callback_data=f"plan_vip:{job_id}")]])
+    await update.message.reply_text(f"Зар #{job_id}-ийн эрхийг сонгоно уу:", reply_markup=kb)
+
+async def plan_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    q=update.callback_query
+    if q.from_user.id != ADMIN_ID:
+        await q.answer("Танд админы эрх байхгүй.", show_alert=True); return
+    action, raw_id=q.data.rsplit(":",1); job_id=int(raw_id)
+    if action=="plan_free": changed=set_job_plan(job_id,"free"); msg="Энгийн зар болголоо."
+    elif action=="plan_premium": changed=set_job_plan(job_id,"premium",7); msg="Premium 7 хоног идэвхжлээ."
+    else: changed=set_job_plan(job_id,"vip",30); msg="VIP 30 хоног идэвхжлээ."
+    await q.answer(msg if changed else "Зар олдсонгүй.", show_alert=True)
 
 
 async def pending(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -372,12 +397,7 @@ async def pending(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     for job in jobs:
-        keyboard = InlineKeyboardMarkup(
-            [[
-                InlineKeyboardButton("✅ Батлах", callback_data=f"approve:{job['id']}"),
-                InlineKeyboardButton("❌ Татгалзах", callback_data=f"reject:{job['id']}"),
-            ]]
-        )
+        keyboard = admin_review_buttons(job["id"])
         await update.message.reply_text(
             job_text(job),
             parse_mode=ParseMode.HTML,
@@ -395,6 +415,7 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         f"👥 Анкет: {data['users']}\n"
         f"📢 Нийт зар: {data['jobs']}\n"
         f"✅ Батлагдсан зар: {data['approved']}\n"
+        f"💎 Premium/VIP: {data['premium']}\n"
         f"📩 Хүсэлт: {data['applications']}"
     )
 
@@ -453,6 +474,9 @@ def main() -> None:
             JOB_TITLE: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, job_title)
             ],
+            JOB_CATEGORY: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, job_category)
+            ],
             JOB_SALARY: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, job_salary)
             ],
@@ -470,6 +494,7 @@ def main() -> None:
     app.add_handler(CommandHandler("cancel", cancel))
     app.add_handler(CommandHandler("pending", pending))
     app.add_handler(CommandHandler("stats", stats_command))
+    app.add_handler(CommandHandler("premium", premium_command))
 
     app.add_handler(profile_conversation)
     app.add_handler(job_conversation)
@@ -477,6 +502,8 @@ def main() -> None:
     app.add_handler(
         MessageHandler(filters.Regex("^🔍 Ажил хайх$"), browse_jobs)
     )
+    app.add_handler(MessageHandler(filters.Regex("^🔙 Үндсэн цэс$"), start))
+    app.add_handler(MessageHandler(filters.Regex("^(" + "|".join(map(re.escape, CATEGORIES)) + ")$"), category_jobs))
     app.add_handler(
         MessageHandler(filters.Regex("^ℹ️ Тусламж$"), help_message)
     )
@@ -491,8 +518,9 @@ def main() -> None:
         CallbackQueryHandler(save_callback, pattern=r"^save:\d+$")
     )
     app.add_handler(
-        CallbackQueryHandler(admin_action, pattern=r"^(approve|reject):\d+$")
+        CallbackQueryHandler(admin_action, pattern=r"^(approve_free|approve_premium|approve_vip|reject):\d+$")
     )
+    app.add_handler(CallbackQueryHandler(plan_action, pattern=r"^(plan_free|plan_premium|plan_vip):\d+$"))
 
     print("Бот ажиллаж эхэллээ...")
     app.run_polling(drop_pending_updates=True)
