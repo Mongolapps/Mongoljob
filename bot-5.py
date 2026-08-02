@@ -174,7 +174,7 @@ def user_text(u):
         f"👤 <b>{escape(u['full_name'])}</b>\n"
         f"🧰 {escape(u['profession'] or '-')}\n"
         f"📚 {escape(u['experience'] or '-')}\n"
-        f"💰 Хүсэж буй цалин: {escape(u['desired_salary'] or '-')}\n"
+        f"💰 Таны хүсэж буй цалин: {escape(u['desired_salary'] or '-')}\n"
         f"💬 Telegram: {escape(username)}"
     )
 
