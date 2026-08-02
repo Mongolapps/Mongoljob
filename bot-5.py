@@ -356,7 +356,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
 
     await update.message.reply_text(
-        "🚀 <b>ServiGo-д тавтай морил!</b>\n\nТа аль хэсгээр үргэлжлүүлэх вэ?",
+        "🚀 <b>ServiGo-д тавтай морил!</b>\n\nТа аль сонголтоор үргэлжлүүлэх вэ?",
         parse_mode=ParseMode.HTML,
         reply_markup=ROLE_MENU,
     )
