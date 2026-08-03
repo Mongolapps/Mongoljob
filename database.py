@@ -5,9 +5,11 @@ DB_PATH = Path(__file__).with_name("servigo.db")
 
 
 def connect():
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=30)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
+    conn.execute("PRAGMA journal_mode = WAL")
+    conn.execute("PRAGMA busy_timeout = 30000")
     return conn
 
 def _cols(conn, table):
@@ -132,7 +134,8 @@ def init_db():
         # Хуучин төлбөрийн баганатай matches хүснэгтийг төлбөргүй бүтэц рүү шилжүүлнэ.
         match_cols = _cols(conn, "matches")
         if "payment_status" in match_cols or "payment_amount" in match_cols or "paid_at" in match_cols:
-            conn.executescript("""
+            connected_expr = "COALESCE(paid_at, CURRENT_TIMESTAMP)" if "paid_at" in match_cols else "CURRENT_TIMESTAMP"
+            conn.executescript(f"""
             ALTER TABLE matches RENAME TO matches_old;
 
             CREATE TABLE matches (
@@ -159,7 +162,7 @@ def init_db():
                     ELSE status
                 END,
                 CASE
-                    WHEN status IN ('connected', 'payment_pending', 'mutual_accepted') THEN COALESCE(paid_at, CURRENT_TIMESTAMP)
+                    WHEN status IN ('connected', 'payment_pending', 'mutual_accepted') THEN {connected_expr}
                     ELSE NULL
                 END,
                 created_at
@@ -430,12 +433,22 @@ def set_user_channel_message(telegram_id, message_id):
 
 def get_promoted_jobs():
     with connect() as conn:
-        return conn.execute("SELECT * FROM jobs WHERE status='approved' AND plan IN ('premium','vip') AND channel_message_id IS NOT NULL").fetchall()
+        return conn.execute("""
+        SELECT * FROM jobs
+        WHERE status='approved' AND plan IN ('premium','vip')
+          AND premium_expires_at > CURRENT_TIMESTAMP
+          AND channel_message_id IS NOT NULL
+        """).fetchall()
 
 
 def get_promoted_users():
     with connect() as conn:
-        return conn.execute("SELECT * FROM users WHERE status='approved' AND plan='premium' AND channel_message_id IS NOT NULL").fetchall()
+        return conn.execute("""
+        SELECT * FROM users
+        WHERE status='approved' AND plan='premium'
+          AND premium_expires_at > CURRENT_TIMESTAMP
+          AND channel_message_id IS NOT NULL
+        """).fetchall()
 
 
 def get_notifiable_users(exclude_id=None):
@@ -452,6 +465,25 @@ def toggle_notifications(telegram_id):
         return bool(row and row[0])
 
 
+
+def expire_promotions():
+    """Хугацаа дууссан premium/vip төлөвийг энгийн төлөвт шилжүүлнэ."""
+    with connect() as conn:
+        conn.execute("""
+        UPDATE jobs
+        SET plan='free', premium_expires_at=NULL
+        WHERE plan IN ('premium','vip')
+          AND premium_expires_at IS NOT NULL
+          AND premium_expires_at <= CURRENT_TIMESTAMP
+        """)
+        conn.execute("""
+        UPDATE users
+        SET plan='free', premium_expires_at=NULL
+        WHERE plan='premium'
+          AND premium_expires_at IS NOT NULL
+          AND premium_expires_at <= CURRENT_TIMESTAMP
+        """)
+
 def stats():
     with connect() as conn:
         q = lambda sql: conn.execute(sql).fetchone()[0]
@@ -466,16 +498,3 @@ def stats():
             "matches": q("SELECT COUNT(*) FROM matches"),
             "connected_matches": q("SELECT COUNT(*) FROM matches WHERE status='connected'"),
         }
-
-
-def get_jobs_by_employer(employer_id, limit=50):
-    with connect() as conn:
-        return conn.execute(
-            """
-            SELECT * FROM jobs
-            WHERE employer_id=?
-            ORDER BY id DESC
-            LIMIT ?
-            """,
-            (employer_id, limit),
-        ).fetchall()
