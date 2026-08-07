@@ -1,4 +1,7 @@
 .env
-jobs.db
 __pycache__/
-*.pyc
+*.py[cod]
+*.db
+*.db-shm
+*.db-wal
+.venv/

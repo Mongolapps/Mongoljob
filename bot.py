@@ -1,12 +1,11 @@
-import asyncio
 import logging
 import os
 import re
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from html import escape
 
 from dotenv import load_dotenv
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton, ReplyKeyboardMarkup, Update
 from telegram.constants import ParseMode
 from telegram.ext import (
     Application, CallbackQueryHandler, CommandHandler, ContextTypes,
@@ -14,638 +13,538 @@ from telegram.ext import (
 )
 
 from database import (
-    add_business, add_job, add_service, approve_business, approve_job, create_booking,
-    create_or_get_match, get_approved_jobs, get_booking, get_business, get_business_by_owner,
-    get_businesses_by_category, get_job, get_match, get_pending_businesses, get_pending_jobs,
-    get_service, get_services_by_business, get_user, init_db, reject_job,
-    approve_user, get_notifiable_users, get_promoted_jobs, get_promoted_users, reject_user,
-    save_user, set_booking_status, set_employer_decision, set_job_channel_message,
-    set_user_channel_message, stats, toggle_notifications, expire_promotions,
+    add_job, close_job, create_match, dashboard_counts, get_business,
+    get_business_by_owner, get_job, get_match, get_seeker, init_db,
+    list_applicant_matches, list_employer_jobs, list_employer_matches,
+    list_favorites, list_jobs, save_business, save_seeker, set_business_status,
+    set_job_channel_message, set_job_plan, set_job_status, set_match_status,
+    set_seeker_plan, set_seeker_status, stats, toggle_favorite,
 )
 
 load_dotenv()
+logging.basicConfig(
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    level=os.getenv("LOG_LEVEL", "INFO").upper(),
+)
+logger = logging.getLogger("servigo")
+
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-try:
-    ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
-except ValueError as exc:
-    raise RuntimeError("ADMIN_ID зөвхөн тоо байх ёстой.") from exc
-CHANNEL_ID = os.getenv("CHANNEL_ID", "@servigomgl").strip()
-PREMIUM_CONTACT = os.getenv("PREMIUM_CONTACT", "bayanburd").lstrip("@").strip()
-if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN олдсонгүй.")
-
-logging.basicConfig(format="%(asctime)s | %(levelname)s | %(name)s | %(message)s", level=logging.INFO)
-logger = logging.getLogger(__name__)
-
-SERVICE_CATEGORIES = ["🏥 Эрүүл мэнд", "💇 Гоо сайхан", "🍽 Хоол", "🏋 Фитнес", "🚗 Авто", "🎓 Сургалт", "🛠 Засвар", "📦 Хүргэлт"]
-JOB_CATEGORIES = ["☕ Үйлчилгээ", "🚗 Жолооч", "🏗 Барилга", "💻 IT", "📊 Оффис", "🛒 Худалдаа", "🍔 Ресторан", "🏭 Үйлдвэр", "📦 Ложистик", "🎓 Боловсрол", "🔧 Инженер", "🏥 Эрүүл мэнд"]
+ADMIN_ID = int(os.getenv("ADMIN_ID", "0") or 0)
+CHANNEL_ID = os.getenv("CHANNEL_ID", "").strip()
+PREMIUM_CONTACT = os.getenv("PREMIUM_CONTACT", "bayanburd").lstrip("@")
 
 (
-    P_NAME, P_PHONE, P_PROFESSION, P_EXPERIENCE, P_SALARY,
-    B_NAME, B_CATEGORY, B_PHONE, B_LOCATION, B_DESCRIPTION,
-    S_TITLE, S_PRICE, S_DURATION, S_DESCRIPTION,
-    J_TITLE, J_TYPE, J_CATEGORY, J_SALARY, J_SCHEDULE, J_LOCATION, J_DESCRIPTION,
-    BK_TIME, BK_NOTE,
-) = range(23)
+    S_NAME, S_PROFESSION, S_LOCATION, S_SALARY, S_PHONE, S_EXPERIENCE,
+    B_NAME, B_PHONE, B_LOCATION,
+    J_TITLE, J_CATEGORY, J_SALARY, J_LOCATION, J_SCHEDULE, J_REQUIREMENTS,
+) = range(15)
 
-MAIN_MENU = ReplyKeyboardMarkup([
-    ["🔎 Үйлчилгээ хайх", "💼 Байнгын ажил"],
-    ["⏰ Цагийн ажил", "👤 Миний анкет"],
-    ["🏢 Байгууллагын хэсэг", "⭐ Premium үйлчилгээ"],
-    ["🔔 Мэдэгдэл", "ℹ️ Тусламж"],
-], resize_keyboard=True)
+JOB_CATEGORIES = [
+    "☕ Үйлчилгээ", "🚗 Жолооч", "🏗 Барилга", "💻 IT",
+    "📊 Оффис", "🛒 Худалдаа", "🍔 Ресторан", "🏭 Үйлдвэр",
+    "📦 Ложистик", "🎓 Боловсрол", "🔧 Инженер", "🏥 Эрүүл мэнд",
+]
 
-BUSINESS_MENU = ReplyKeyboardMarkup([
-    ["🏢 Байгууллага бүртгэх", "➕ Үйлчилгээ нэмэх"],
-    ["📢 Байнгын ажилтан хайх", "⏰ Цагийн ажилтан хайх"],
-    ["📋 Миний үйлчилгээ", "🔙 Үндсэн цэс"],
-], resize_keyboard=True)
+ROLE_MENU = ReplyKeyboardMarkup(
+    [["👤 Ажил хайгч", "🏢 Ажил олгогч"]], resize_keyboard=True
+)
+SEEKER_MENU = ReplyKeyboardMarkup(
+    [
+        ["💼 Байнгын ажил", "⏰ Цагийн ажил"],
+        ["👤 Миний анкет", "📊 Миний самбар"],
+        ["❤️ Хадгалсан", "⭐ VIP зар"],
+        ["🔄 Горим солих"],
+    ], resize_keyboard=True,
+)
+EMPLOYER_MENU = ReplyKeyboardMarkup(
+    [
+        ["🏢 Байгууллага бүртгэх"],
+        ["➕ Байнгын ажлын зар", "➕ Цагийн ажлын зар"],
+        ["📋 Миний зарууд", "📨 Ирсэн хүсэлтүүд"],
+        ["📊 Миний самбар", "⭐ VIP зар"],
+        ["🔄 Горим солих"],
+    ], resize_keyboard=True,
+)
+CANCEL_MENU = ReplyKeyboardMarkup([["❌ Цуцлах"]], resize_keyboard=True)
+CONTACT_MENU = ReplyKeyboardMarkup(
+    [[KeyboardButton("📱 Утас хуваалцах", request_contact=True)], ["❌ Цуцлах"]],
+    resize_keyboard=True, one_time_keyboard=True,
+)
+CATEGORY_MENU = ReplyKeyboardMarkup(
+    [JOB_CATEGORIES[i:i + 2] for i in range(0, len(JOB_CATEGORIES), 2)] + [["❌ Цуцлах"]],
+    resize_keyboard=True,
+)
 
-SERVICE_MENU = ReplyKeyboardMarkup([[SERVICE_CATEGORIES[i], SERVICE_CATEGORIES[i+1]] for i in range(0, len(SERVICE_CATEGORIES), 2)] + [["🔙 Үндсэн цэс"]], resize_keyboard=True)
-JOB_MENU = ReplyKeyboardMarkup([[JOB_CATEGORIES[i], JOB_CATEGORIES[i+1]] for i in range(0, len(JOB_CATEGORIES), 2)] + [["🔙 Үндсэн цэс"]], resize_keyboard=True)
-JOB_TYPE_MENU = ReplyKeyboardMarkup([["💼 Байнгын ажил", "⏰ Цагийн ажил"], ["🔙 Үндсэн цэс"]], resize_keyboard=True)
-
-
-def is_valid_phone(value: str) -> bool:
-    digits = re.sub(r"\D", "", value)
-    return 8 <= len(digits) <= 15
-
-
-def parse_requested_time(value: str):
-    try:
-        requested = datetime.strptime(value.strip(), "%Y-%m-%d %H:%M").replace(tzinfo=timezone.utc)
-    except ValueError:
-        return None
-    return requested if requested > datetime.now(timezone.utc) else None
-
-
-def active_promotion(row) -> bool:
-    expires_at = row["premium_expires_at"]
-    if not expires_at:
-        return False
-    try:
-        end = datetime.fromisoformat(str(expires_at).replace("Z", "+00:00"))
-        if end.tzinfo is None:
-            end = end.replace(tzinfo=timezone.utc)
-        return end > datetime.now(timezone.utc)
-    except (TypeError, ValueError):
-        return False
+TEXT_INPUT = filters.TEXT & ~filters.COMMAND & ~filters.Regex(r"^❌ Цуцлах$")
+PHONE_INPUT = filters.CONTACT | TEXT_INPUT
 
 
+def expires_after(days: int = 0, hours: int = 0) -> str:
+    return (datetime.now(timezone.utc) + timedelta(days=days, hours=hours)).isoformat()
 
-def remaining_text(expires_at):
-    if not expires_at:
+
+def validate_config() -> None:
+    if not BOT_TOKEN:
+        raise RuntimeError("BOT_TOKEN тохируулаагүй байна")
+    if not re.fullmatch(r"\d+:[A-Za-z0-9_-]{20,}", BOT_TOKEN):
+        raise RuntimeError("BOT_TOKEN буруу форматтай байна. BotFather-оос авсан token оруулна уу")
+    if ADMIN_ID <= 0:
+        raise RuntimeError("ADMIN_ID-д админы Telegram numeric ID оруулна уу")
+
+
+def remaining_text(value: str | None) -> str:
+    if not value:
         return ""
     try:
-        end = datetime.fromisoformat(str(expires_at).replace("Z", "+00:00"))
-        if end.tzinfo is None:
-            end = end.replace(tzinfo=timezone.utc)
-        seconds = max(0, int((end - datetime.now(timezone.utc)).total_seconds()))
+        end = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        seconds = int((end - datetime.now(timezone.utc)).total_seconds())
         if seconds <= 0:
             return "⌛ Хугацаа дууссан"
         days, rem = divmod(seconds, 86400)
-        hours, rem = divmod(rem, 3600)
-        minutes = rem // 60
-        if days:
-            return f"⏳ Үлдсэн: {days} өдөр {hours} цаг"
-        return f"⏳ Үлдсэн: {hours:02d}:{minutes:02d}"
-    except (TypeError, ValueError):
+        hours = rem // 3600
+        return f"⏳ {days} өдөр {hours} цаг үлдсэн" if days else f"⏳ {hours} цаг үлдсэн"
+    except ValueError:
         return ""
 
 
-def user_text(u):
-    badge = "⭐ <b>PREMIUM АНКЕТ</b>\n" if u["plan"] == "premium" and active_promotion(u) else "👤 <b>АЖИЛ ХАЙЖ БАЙНА</b>\n"
-    timer = remaining_text(u["premium_expires_at"]) if active_promotion(u) else ""
-    timer_line = f"{timer}\n\n" if timer else "\n"
-    username = f"@{u['username']}" if u["username"] else "Нууц"
+def role_menu(context: ContextTypes.DEFAULT_TYPE):
+    return EMPLOYER_MENU if context.user_data.get("role") == "employer" else SEEKER_MENU
+
+
+def seeker_text(row) -> str:
+    badge = "⭐ <b>VIP АНКЕТ</b>\n" if row["plan"] != "free" else "👤 <b>АЖИЛ ХАЙГЧ</b>\n"
+    timer = remaining_text(row["premium_expires_at"])
     return (
-        f"{badge}{timer_line}"
-        f"👤 <b>{escape(u['full_name'])}</b>\n"
-        f"🧰 {escape(u['profession'] or '-')}\n"
-        f"📚 {escape(u['experience'] or '-')}\n"
-        f"💰 Хүсэж буй цалин: {escape(u['desired_salary'] or '-')}\n"
-        f"💬 Telegram: {escape(username)}"
+        f"{badge}{timer + chr(10) if timer else ''}\n"
+        f"👤 <b>{escape(row['full_name'])}</b>\n"
+        f"💼 {escape(row['profession'])}\n"
+        f"📍 {escape(row['location'])}\n"
+        f"💰 {escape(row['desired_salary'])}\n"
+        f"📚 {escape(row['experience'] or 'Туршлага оруулаагүй')}\n"
+        f"📌 Төлөв: <b>{escape(row['status'])}</b>"
     )
 
 
-def business_text(b):
-    badge = "✅ <b>VERIFIED</b>\n" if b["status"] == "approved" else ""
-    return (f"{badge}🏢 <b>{escape(b['name'])}</b>\n"
-            f"📂 {escape(b['category'])}\n📍 {escape(b['location'])}\n"
-            f"☎️ {escape(b['phone'])}\n\n{escape(b['description'])}\n\n🆔 Байгууллага #{b['id']}")
+def job_text(row, include_contact: bool = False) -> str:
+    badge = "👑 <b>VIP ЗАР</b>\n" if row["plan"] == "vip" else ("⭐ <b>PREMIUM ЗАР</b>\n" if row["plan"] == "premium" else "")
+    timer = remaining_text(row["premium_expires_at"])
+    verified = " ✅" if row["business_verified"] else ""
+    type_label = "⏰ Цагийн ажил" if row["job_type"] == "part_time" else "💼 Байнгын ажил"
+    contact = f"\n☎️ {escape(row['business_phone'])}" if include_contact else ""
+    return (
+        f"{badge}{timer + chr(10) if timer else ''}\n"
+        f"🏢 <b>{escape(row['company'])}</b>{verified}\n"
+        f"💼 <b>{escape(row['title'])}</b>\n\n"
+        f"{type_label}\n"
+        f"💰 <b>{escape(row['salary'])}</b>\n"
+        f"📍 {escape(row['location'])}\n"
+        f"🕒 {escape(row['schedule'])}\n"
+        f"📂 {escape(row['category'])}\n\n"
+        f"📌 <b>Шаардлага</b>\n{escape(row['requirements'])}"
+        f"{contact}\n\n🆔 Зар #{row['id']} · 👀 {row['views']}"
+    )
 
 
-def service_text(s):
-    return (f"🏢 <b>{escape(s['business_name'])}</b>\n\n"
-            f"🛍 <b>{escape(s['title'])}</b>\n💰 {escape(s['price'])}\n"
-            f"⏱ {escape(s['duration'])}\n📍 {escape(s['location'])}\n\n"
-            f"{escape(s['description'])}\n\n🆔 Үйлчилгээ #{s['id']}")
-
-
-def job_text(j):
-    promoted = active_promotion(j)
-    badge = "👑 <b>VIP ЗАР</b>\n" if promoted and j["plan"] == "vip" else ("⭐ <b>PREMIUM ЗАР</b>\n" if promoted and j["plan"] == "premium" else "")
-    timer = remaining_text(j["premium_expires_at"]) if promoted else ""
-    timer_line = f"{timer}\n\n" if timer else ("\n" if badge else "")
-    type_label = "⏰ Цагийн ажил" if j["job_type"] == "part_time" else "💼 Байнгын ажил"
-    return (f"{badge}{timer_line}🏢 <b>{escape(j['company'])}</b>\n\n"
-            f"{type_label}\n💼 <b>{escape(j['title'])}</b>\n📂 {escape(j['category'])}\n"
-            f"💰 {escape(j['salary'])}\n🕒 {escape(j['schedule'])}\n📍 {escape(j['location'])}\n\n"
-            f"📌 <b>Шаардлага</b>\n{escape(j['description'])}\n\n🆔 Зар #{j['id']}")
-
-
-def match_score(user, job):
-    score = 50
-    words = set(re.findall(r"\w{3,}", (user["profession"] or "").lower()))
-    target = set(re.findall(r"\w{3,}", (job["title"] + " " + job["description"]).lower()))
-    score += min(len(words & target) * 10, 30)
-    desired = [int(x.replace(",", "")) for x in re.findall(r"\d[\d,]*", user["desired_salary"] or "")]
+def match_score(seeker, job) -> tuple[int, str]:
+    profession_words = set(re.findall(r"[\wА-Яа-яӨөҮү]{3,}", seeker["profession"].lower()))
+    job_words = set(re.findall(r"[\wА-Яа-яӨөҮү]{3,}", f"{job['title']} {job['requirements']} {job['category']}".lower()))
+    overlap = profession_words & job_words
+    score = 20
+    reasons = []
+    if overlap:
+        score += min(45, len(overlap) * 15)
+        reasons.append("✅ Мэргэжил/ур чадвар ойролцоо")
+    else:
+        reasons.append("⚠️ Мэргэжлийн түлхүүр үг таараагүй")
+    if seeker["location"].lower() in job["location"].lower() or job["location"].lower() in seeker["location"].lower():
+        score += 20
+        reasons.append("✅ Байршил тохирч байна")
+    desired = [int(x.replace(",", "")) for x in re.findall(r"\d[\d,]*", seeker["desired_salary"])]
     offered = [int(x.replace(",", "")) for x in re.findall(r"\d[\d,]*", job["salary"])]
-    if desired and offered and max(offered) >= max(desired): score += 15
-    return min(score, 99)
+    if desired and offered and max(offered) >= min(desired):
+        score += 15
+        reasons.append("✅ Цалингийн хүлээлт боломжтой")
+    return min(score, 95), "\n".join(reasons)
 
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data.pop("browse_job_type", None)
-    if context.args and context.args[0].startswith("job_"):
-        try:
-            job_id = int(context.args[0].split("_", 1)[1])
-        except (IndexError, ValueError):
-            job_id = 0
-        job = get_job(job_id) if job_id else None
-        if job and job["status"] == "approved":
-            await update.message.reply_text(
-                job_text(job),
-                parse_mode=ParseMode.HTML,
-                reply_markup=InlineKeyboardMarkup([[
-                    InlineKeyboardButton("🤝 Match шалгах", callback_data=f"match:{job['id']}"),
-                    InlineKeyboardButton("✅ Сонирхож байна", callback_data=f"interest:{job['id']}"),
-                ]]),
-            )
-            return
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    args = context.args
+    if args and args[0].startswith("job_"):
+        await show_job(update, context, int(args[0].split("_", 1)[1]))
+        return
     await update.message.reply_text(
-        "🚀 <b>ServiGo</b>\n\nҮйлчилгээ, байнгын ажил, цагийн ажлыг нэг дороос.",
-        parse_mode=ParseMode.HTML,
-        reply_markup=MAIN_MENU,
+        "🚀 <b>ServiGo</b>\n\nАжил хайгч, ажил олгогчийг хурдан бөгөөд аюулгүй холбоно.\n\nТа аль хэлбэрээр ашиглах вэ?",
+        parse_mode=ParseMode.HTML, reply_markup=ROLE_MENU,
     )
 
 
-async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def choose_seeker(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    context.user_data.clear(); context.user_data["role"] = "seeker"
+    await update.message.reply_text("👤 Ажил хайгчийн хэсэг", reply_markup=SEEKER_MENU)
+
+
+async def choose_employer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    context.user_data.clear(); context.user_data["role"] = "employer"
+    await update.message.reply_text("🏢 Ажил олгогчийн хэсэг", reply_markup=EMPLOYER_MENU)
+
+
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    role = context.user_data.get("role")
     context.user_data.clear()
-    await update.message.reply_text("Үйлдлийг цуцаллаа.", reply_markup=MAIN_MENU)
+    if role:
+        context.user_data["role"] = role
+    await update.message.reply_text("Үйлдлийг цуцаллаа.", reply_markup=role_menu(context))
     return ConversationHandler.END
 
 
-# ----- Хэрэглэгчийн анкет -----
-async def profile_start(update, context): await update.message.reply_text("Овог нэрээ оруулна уу:"); return P_NAME
-async def p_name(update, context): context.user_data["full_name"] = update.message.text.strip(); await update.message.reply_text("Утасны дугаар:"); return P_PHONE
-async def p_phone(update, context):
-    phone = update.message.text.strip()
-    if not is_valid_phone(phone):
-        await update.message.reply_text("Утасны дугаар буруу байна. 8-15 оронтой дугаар оруулна уу:")
-        return P_PHONE
-    context.user_data["phone"] = phone
-    await update.message.reply_text("Мэргэжил, хийж чадах ажил:")
-    return P_PROFESSION
-async def p_prof(update, context): context.user_data["profession"] = update.message.text.strip(); await update.message.reply_text("Туршлага:"); return P_EXPERIENCE
-async def p_exp(update, context): context.user_data["experience"] = update.message.text.strip(); await update.message.reply_text("Хүсэж буй цалин:"); return P_SALARY
-async def p_salary(update, context):
-    u = update.effective_user
-    context.user_data.update(desired_salary=update.message.text.strip(), telegram_id=u.id, username=u.username)
-    save_user(context.user_data)
-    saved = get_user(u.id)
-    context.user_data.clear()
-    await update.message.reply_text("✅ Анкет хүлээн авлаа. Админ шалгаж батална.", reply_markup=MAIN_MENU)
+async def seeker_start(update, context):
+    context.user_data["draft"] = {}
+    await update.message.reply_text("👤 Таны нэр?", reply_markup=CANCEL_MENU); return S_NAME
+async def seeker_name(update, context):
+    context.user_data["draft"]["full_name"] = update.message.text.strip()
+    await update.message.reply_text("💼 Ямар ажил хийдэг вэ?"); return S_PROFESSION
+async def seeker_profession(update, context):
+    context.user_data["draft"]["profession"] = update.message.text.strip()
+    await update.message.reply_text("📍 Хаана ажиллах вэ?"); return S_LOCATION
+async def seeker_location(update, context):
+    context.user_data["draft"]["location"] = update.message.text.strip()
+    await update.message.reply_text("💰 Хүсэж буй цалин?"); return S_SALARY
+async def seeker_salary(update, context):
+    context.user_data["draft"]["desired_salary"] = update.message.text.strip()
+    await update.message.reply_text("📱 Утасны дугаар?", reply_markup=CONTACT_MENU); return S_PHONE
+async def seeker_phone(update, context):
+    if update.message.contact and update.message.contact.user_id not in (None, update.effective_user.id):
+        await update.message.reply_text("Өөрийн утасны дугаарыг хуваалцана уу.", reply_markup=CONTACT_MENU)
+        return S_PHONE
+    phone = update.message.contact.phone_number if update.message.contact else update.message.text.strip()
+    context.user_data["draft"]["phone"] = phone
+    await update.message.reply_text("📚 Туршлага? (ж: 2 жил, эсвэл Байхгүй)", reply_markup=CANCEL_MENU); return S_EXPERIENCE
+async def seeker_experience(update, context):
+    user = update.effective_user
+    data = context.user_data["draft"]
+    data.update(telegram_id=user.id, username=user.username, experience=update.message.text.strip())
+    save_seeker(data)
+    row = get_seeker(user.id)
+    context.user_data.pop("draft", None)
+    await update.message.reply_text("✅ Анкет илгээгдлээ. Админ шалгасны дараа мэдэгдэнэ.", reply_markup=SEEKER_MENU)
+    if ADMIN_ID:
+        await context.bot.send_message(
+            ADMIN_ID, "🆕 <b>Шинэ анкет</b>\n\n" + seeker_text(row), parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("✅ Батлах", callback_data=f"admin_seeker_yes:{user.id}"),
+                InlineKeyboardButton("❌ Татгалзах", callback_data=f"admin_seeker_no:{user.id}"),
+            ]]),
+        )
+    return ConversationHandler.END
+
+
+async def business_start(update, context):
+    context.user_data["draft"] = {}
+    await update.message.reply_text("🏢 Байгууллагын нэр?", reply_markup=CANCEL_MENU); return B_NAME
+async def business_name(update, context):
+    context.user_data["draft"]["name"] = update.message.text.strip()
+    await update.message.reply_text("📱 Холбоо барих утас?", reply_markup=CONTACT_MENU); return B_PHONE
+async def business_phone(update, context):
+    if update.message.contact and update.message.contact.user_id not in (None, update.effective_user.id):
+        await update.message.reply_text("Өөрийн утасны дугаарыг хуваалцана уу.", reply_markup=CONTACT_MENU)
+        return B_PHONE
+    context.user_data["draft"]["phone"] = update.message.contact.phone_number if update.message.contact else update.message.text.strip()
+    await update.message.reply_text("📍 Байршил?", reply_markup=CANCEL_MENU); return B_LOCATION
+async def business_location(update, context):
+    user = update.effective_user; data = context.user_data["draft"]
+    data.update(owner_id=user.id, owner_username=user.username, location=update.message.text.strip())
+    business_id = save_business(data); business = get_business(business_id)
+    context.user_data.pop("draft", None)
+    await update.message.reply_text("✅ Байгууллагын мэдээлэл илгээгдлээ.", reply_markup=EMPLOYER_MENU)
     if ADMIN_ID:
         await context.bot.send_message(
             ADMIN_ID,
-            "🆕 <b>Шинэ ажил хайгчийн анкет</b>\n\n" + user_text(saved),
+            f"🆕 <b>Шинэ байгууллага</b>\n\n🏢 {escape(business['name'])}\n📍 {escape(business['location'])}\n☎️ {escape(business['phone'])}",
             parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("✅ Батлах", callback_data=f"admin_business_yes:{business_id}"),
+                InlineKeyboardButton("❌ Татгалзах", callback_data=f"admin_business_no:{business_id}"),
+            ]]),
+        )
+    return ConversationHandler.END
+
+
+async def job_start(update, context, job_type: str):
+    business = get_business_by_owner(update.effective_user.id)
+    if not business or business["status"] != "approved":
+        await update.message.reply_text("Эхлээд байгууллагаа бүртгүүлж, батлуулна уу.", reply_markup=EMPLOYER_MENU)
+        return ConversationHandler.END
+    context.user_data["draft"] = {"job_type": job_type, "business_id": business["id"], "employer_id": update.effective_user.id}
+    await update.message.reply_text("💼 Ажлын байрны нэр?", reply_markup=CANCEL_MENU); return J_TITLE
+async def job_start_full(update, context): return await job_start(update, context, "full_time")
+async def job_start_part(update, context): return await job_start(update, context, "part_time")
+async def job_title(update, context):
+    context.user_data["draft"]["title"] = update.message.text.strip()
+    await update.message.reply_text("📂 Ангилал?", reply_markup=CATEGORY_MENU); return J_CATEGORY
+async def job_category(update, context):
+    if update.message.text not in JOB_CATEGORIES:
+        await update.message.reply_text("Доорх ангиллаас сонгоно уу."); return J_CATEGORY
+    context.user_data["draft"]["category"] = update.message.text
+    await update.message.reply_text("💰 Цалин?", reply_markup=CANCEL_MENU); return J_SALARY
+async def job_salary(update, context):
+    context.user_data["draft"]["salary"] = update.message.text.strip()
+    await update.message.reply_text("📍 Ажлын байршил?"); return J_LOCATION
+async def job_location(update, context):
+    context.user_data["draft"]["location"] = update.message.text.strip()
+    await update.message.reply_text("🕒 Ажлын цаг?"); return J_SCHEDULE
+async def job_schedule(update, context):
+    context.user_data["draft"]["schedule"] = update.message.text.strip()
+    await update.message.reply_text("📌 Гол шаардлага? (1–3 өгүүлбэр)"); return J_REQUIREMENTS
+async def job_requirements(update, context):
+    data = context.user_data["draft"]; data["requirements"] = update.message.text.strip()
+    job_id = add_job(data); job = get_job(job_id)
+    context.user_data.pop("draft", None)
+    await update.message.reply_text("✅ Зар илгээгдлээ. Батлагдсаны дараа нийтлэгдэнэ.", reply_markup=EMPLOYER_MENU)
+    if ADMIN_ID:
+        await context.bot.send_message(
+            ADMIN_ID, "🆕 <b>Шинэ ажлын зар</b>\n\n" + job_text(job), parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup([
-                [
-                    InlineKeyboardButton("✅ Энгийн", callback_data=f"user_free:{u.id}"),
-                    InlineKeyboardButton("⭐ Premium 24ц / 3,000₮", callback_data=f"user_premium:{u.id}"),
-                ],
-                [
-                    InlineKeyboardButton("❌ Татгалзах", callback_data=f"user_no:{u.id}"),
-                    InlineKeyboardButton("💬 @bayanburd", url=f"https://t.me/{PREMIUM_CONTACT}"),
-                ],
+                [InlineKeyboardButton("✅ Энгийн", callback_data=f"admin_job_free:{job_id}"),
+                 InlineKeyboardButton("⭐ Premium 24ц", callback_data=f"admin_job_premium:{job_id}")],
+                [InlineKeyboardButton("👑 VIP 30 хоног", callback_data=f"admin_job_vip:{job_id}"),
+                 InlineKeyboardButton("❌ Татгалзах", callback_data=f"admin_job_no:{job_id}")],
             ]),
         )
     return ConversationHandler.END
 
 
-# ----- Байгууллага -----
-async def business_menu(update, context): await update.message.reply_text("🏢 Байгууллагын удирдлага", reply_markup=BUSINESS_MENU)
-async def business_start(update, context):
-    context.user_data["owner_id"] = update.effective_user.id; context.user_data["owner_username"] = update.effective_user.username
-    await update.message.reply_text("Байгууллагын нэр:"); return B_NAME
-async def b_name(update, context): context.user_data["name"] = update.message.text.strip(); await update.message.reply_text("Ангилал:", reply_markup=SERVICE_MENU); return B_CATEGORY
-async def b_cat(update, context):
-    if update.message.text not in SERVICE_CATEGORIES: await update.message.reply_text("Ангиллаа товчоор сонгоно уу."); return B_CATEGORY
-    context.user_data["category"] = update.message.text; await update.message.reply_text("Утас:"); return B_PHONE
-async def b_phone(update, context):
-    phone = update.message.text.strip()
-    if not is_valid_phone(phone):
-        await update.message.reply_text("Утасны дугаар буруу байна. 8-15 оронтой дугаар оруулна уу:")
-        return B_PHONE
-    context.user_data["phone"] = phone
-    await update.message.reply_text("Байршил:")
-    return B_LOCATION
-async def b_location(update, context): context.user_data["location"] = update.message.text.strip(); await update.message.reply_text("Товч танилцуулга:"); return B_DESCRIPTION
-async def b_desc(update, context):
-    context.user_data["description"] = update.message.text.strip(); bid = add_business(context.user_data); b = get_business(bid); context.user_data.clear()
-    await update.message.reply_text(f"✅ Байгууллага #{bid} хүлээн авлаа. Админ батална.", reply_markup=BUSINESS_MENU)
-    if ADMIN_ID:
-        await context.bot.send_message(ADMIN_ID, "🆕 <b>Шинэ байгууллага</b>\n\n" + business_text(b), parse_mode=ParseMode.HTML,
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✅ Батлах", callback_data=f"biz_yes:{bid}"), InlineKeyboardButton("❌ Татгалзах", callback_data=f"biz_no:{bid}")]]))
-    return ConversationHandler.END
-
-
-# ----- Үйлчилгээ нэмэх -----
-async def service_start(update, context):
-    b = get_business_by_owner(update.effective_user.id)
-    if not b or b["status"] != "approved":
-        await update.message.reply_text("Эхлээд байгууллагаа бүртгүүлж, админаар батлуулна уу.", reply_markup=BUSINESS_MENU); return ConversationHandler.END
-    context.user_data["business_id"] = b["id"]; await update.message.reply_text("Үйлчилгээний нэр:"); return S_TITLE
-async def s_title(update, context): context.user_data["title"] = update.message.text.strip(); await update.message.reply_text("Үнэ:"); return S_PRICE
-async def s_price(update, context): context.user_data["price"] = update.message.text.strip(); await update.message.reply_text("Үргэлжлэх хугацаа:"); return S_DURATION
-async def s_duration(update, context): context.user_data["duration"] = update.message.text.strip(); await update.message.reply_text("Тайлбар:"); return S_DESCRIPTION
-async def s_desc(update, context):
-    context.user_data["description"] = update.message.text.strip(); sid = add_service(context.user_data); context.user_data.clear()
-    await update.message.reply_text(f"✅ Үйлчилгээ #{sid} нэмэгдлээ.", reply_markup=BUSINESS_MENU); return ConversationHandler.END
-
-
-# ----- Ажлын зар -----
-async def job_start_full(update, context): context.user_data["preset_job_type"] = "full_time"; return await job_start(update, context)
-async def job_start_part(update, context): context.user_data["preset_job_type"] = "part_time"; return await job_start(update, context)
-async def job_start(update, context):
-    b = get_business_by_owner(update.effective_user.id)
-    if not b or b["status"] != "approved":
-        await update.message.reply_text("Ажлын зар оруулахын өмнө баталгаажсан байгууллагатай байна уу.", reply_markup=BUSINESS_MENU); return ConversationHandler.END
-    context.user_data.update(employer_id=update.effective_user.id, employer_username=update.effective_user.username, business_id=b["id"], company=b["name"])
-    if context.user_data.get("preset_job_type"):
-        context.user_data["job_type"] = context.user_data.pop("preset_job_type")
-        await update.message.reply_text("Ажлын байрны нэр:"); return J_TITLE
-    await update.message.reply_text("Ажлын байрны нэр:"); return J_TITLE
-async def j_title(update, context):
-    context.user_data["title"] = update.message.text.strip()
-    if "job_type" not in context.user_data: await update.message.reply_text("Ажлын төрлөө сонгоно уу:", reply_markup=JOB_TYPE_MENU); return J_TYPE
-    await update.message.reply_text("Ангилал:", reply_markup=JOB_MENU); return J_CATEGORY
-async def j_type(update, context):
-    if update.message.text == "💼 Байнгын ажил": context.user_data["job_type"] = "full_time"
-    elif update.message.text == "⏰ Цагийн ажил": context.user_data["job_type"] = "part_time"
-    else: await update.message.reply_text("Төрлөө сонгоно уу."); return J_TYPE
-    await update.message.reply_text("Ангилал:", reply_markup=JOB_MENU); return J_CATEGORY
-async def j_cat(update, context):
-    if update.message.text not in JOB_CATEGORIES: await update.message.reply_text("Ангиллаа товчоор сонгоно уу."); return J_CATEGORY
-    context.user_data["category"] = update.message.text; await update.message.reply_text("Цалин/хөлс:"); return J_SALARY
-async def j_salary(update, context): context.user_data["salary"] = update.message.text.strip(); await update.message.reply_text("Ажлын цаг, хуваарь:"); return J_SCHEDULE
-async def j_schedule(update, context): context.user_data["schedule"] = update.message.text.strip(); await update.message.reply_text("Байршил:"); return J_LOCATION
-async def j_location(update, context): context.user_data["location"] = update.message.text.strip(); await update.message.reply_text("Үүрэг, шаардлага:"); return J_DESCRIPTION
-async def j_desc(update, context):
-    context.user_data["description"] = update.message.text.strip(); jid = add_job(context.user_data); j = get_job(jid); context.user_data.clear()
-    await update.message.reply_text(f"✅ Зар #{jid} хүлээн авлаа. Админ батална.", reply_markup=BUSINESS_MENU)
-    if ADMIN_ID:
-        await context.bot.send_message(ADMIN_ID, "🆕 <b>Шинэ ажлын зар</b>\n\n" + job_text(j), parse_mode=ParseMode.HTML,
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✅ Энгийн", callback_data=f"job_free:{jid}"), InlineKeyboardButton("⭐ Premium 24ц / 5,000₮", callback_data=f"job_premium:{jid}")], [InlineKeyboardButton("👑 VIP 30хон / 35,000₮", callback_data=f"job_vip:{jid}"), InlineKeyboardButton("❌ Татгалзах", callback_data=f"job_no:{jid}")]]))
-    return ConversationHandler.END
-
-
-# ----- Хайлт -----
-async def browse_services(update, context):
-    context.user_data.pop("browse_job_type", None)
-    await update.message.reply_text("Үйлчилгээний ангилал сонгоно уу:", reply_markup=SERVICE_MENU)
-async def browse_full(update, context): context.user_data["browse_job_type"] = "full_time"; await update.message.reply_text("Байнгын ажлын ангилал:", reply_markup=JOB_MENU)
-async def browse_part(update, context): context.user_data["browse_job_type"] = "part_time"; await update.message.reply_text("Цагийн ажлын ангилал:", reply_markup=JOB_MENU)
-async def service_category(update, context):
-    businesses = get_businesses_by_category(update.message.text)
-    if not businesses: await update.message.reply_text("Одоогоор байгууллага алга.", reply_markup=SERVICE_MENU); return
-    for b in businesses:
-        services = get_services_by_business(b["id"])
-        await update.message.reply_text(business_text(b), parse_mode=ParseMode.HTML)
-        for s0 in services:
-            s = get_service(s0["id"])
-            await update.message.reply_text(service_text(s), parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📅 Цаг захиалах", callback_data=f"book:{s['id']}")]]))
-async def job_category(update, context):
-    job_type = context.user_data.get("browse_job_type")
-    if not job_type: return
-    jobs = get_approved_jobs(job_type, update.message.text)
-    if not jobs: await update.message.reply_text("Одоогоор зар алга.", reply_markup=JOB_MENU); return
-    for j in jobs:
-        await update.message.reply_text(job_text(j), parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🤝 Match шалгах", callback_data=f"match:{j['id']}"), InlineKeyboardButton("✅ Сонирхож байна", callback_data=f"interest:{j['id']}")]]))
-
-async def category_router(update, context):
-    category = update.message.text
-    if context.user_data.get("browse_job_type") and category in JOB_CATEGORIES:
-        await job_category(update, context)
-    elif category in SERVICE_CATEGORIES:
-        await service_category(update, context)
-    else:
-        await update.message.reply_text("Эхлээд Үйлчилгээ, Байнгын ажил эсвэл Цагийн ажил хэсгээ сонгоно уу.", reply_markup=MAIN_MENU)
-
-
-# ----- Захиалга -----
-async def book_callback(update, context):
-    q = update.callback_query; s = get_service(int(q.data.split(":")[1]))
-    if not s or s["business_status"] != "approved": await q.answer("Үйлчилгээ идэвхгүй.", show_alert=True); return ConversationHandler.END
-    context.user_data["booking_service_id"] = s["id"]
-    await q.answer(); await q.message.reply_text("Хүсэж буй өдөр, цагаа бичнэ үү. Жишээ: 2026-08-02 15:00")
-    return BK_TIME
-async def bk_time(update, context):
-    value = update.message.text.strip()
-    if not parse_requested_time(value):
-        await update.message.reply_text("Огноо буруу эсвэл өнгөрсөн байна. Жишээ: 2026-08-05 15:00")
-        return BK_TIME
-    context.user_data["requested_time"] = value
-    await update.message.reply_text("Нэмэлт тайлбар (байхгүй бол - гэж бичнэ үү):")
-    return BK_NOTE
-async def bk_note(update, context):
-    sid = context.user_data.pop("booking_service_id"); requested = context.user_data.pop("requested_time"); note = update.message.text.strip()
-    bid, created = create_booking(sid, update.effective_user.id, requested, note)
-    b = get_booking(bid)
-    await update.message.reply_text("✅ Захиалгын хүсэлт илгээгдлээ." if created else "Энэ цагийн хүсэлт өмнө бүртгэгдсэн байна.", reply_markup=MAIN_MENU)
-    if created:
-        await context.bot.send_message(b["owner_id"], f"📅 <b>ШИНЭ ЗАХИАЛГА</b>\n\n🏢 {escape(b['business_name'])}\n🛍 {escape(b['service_title'])}\n👤 {escape(b['full_name'] or str(b['customer_id']))}\n☎️ {escape(b['phone'] or 'Анкетгүй')}\n🕒 {escape(b['requested_time'])}\n📝 {escape(b['note'] or '-')}", parse_mode=ParseMode.HTML,
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✅ Батлах", callback_data=f"booking_yes:{bid}"), InlineKeyboardButton("❌ Татгалзах", callback_data=f"booking_no:{bid}")]]))
-    return ConversationHandler.END
-
-
-# ----- Match -----
-async def match_callback(update, context):
-    q = update.callback_query; user = get_user(q.from_user.id); job = get_job(int(q.data.split(":")[1]))
-    if not job or job["status"] != "approved": await q.answer("Энэ зар идэвхгүй байна.", show_alert=True); return
-    if not user: await q.answer("Эхлээд анкетаа бөглөнө үү.", show_alert=True); return
-    score = match_score(user, job); await q.answer(); await q.message.reply_text(f"🤖 Таны Match: <b>{score}%</b>", parse_mode=ParseMode.HTML)
-async def interest_callback(update, context):
-    q = update.callback_query; user = get_user(q.from_user.id); job = get_job(int(q.data.split(":")[1]))
-    if not job or job["status"] != "approved": await q.answer("Энэ зар идэвхгүй байна.", show_alert=True); return
-    if not user: await q.answer("Эхлээд анкетаа бөглөнө үү.", show_alert=True); return
-    if q.from_user.id == job["employer_id"]: await q.answer("Өөрийн зар дээр хүсэлт өгөхгүй.", show_alert=True); return
-    score = match_score(user, job); mid, created = create_or_get_match(job["id"], q.from_user.id, score)
-    await q.answer("Сонирхлоо илгээлээ." if created else "Өмнө илгээсэн байна.", show_alert=True)
-    if created:
-        await context.bot.send_message(job["employer_id"], f"🤝 <b>ШИНЭ MATCH</b>\n\n💼 {escape(job['title'])}\n👤 {escape(user['full_name'])}\n🧰 {escape(user['profession'] or '-') }\n📚 {escape(user['experience'] or '-') }\n⭐ {score}%\n\n🔒 Холбоо барих мэдээлэл нууц.", parse_mode=ParseMode.HTML,
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✅ Зөвшөөрөх", callback_data=f"emp_yes:{mid}"), InlineKeyboardButton("❌ Татгалзах", callback_data=f"emp_no:{mid}")]]))
-
-
-# ----- Callback admin/decision -----
-async def business_admin(update, context):
-    q = update.callback_query
-    if q.from_user.id != ADMIN_ID: await q.answer("Админ эрхгүй.", show_alert=True); return
-    action, raw = q.data.split(":"); bid = int(raw); b = get_business(bid); ok = approve_business(bid, action == "biz_yes")
-    await q.answer("Шийдвэр хадгалагдлаа." if ok else "Өмнө шийдвэрлэсэн.", show_alert=True); await q.edit_message_reply_markup(None)
-    if ok: await context.bot.send_message(b["owner_id"], "✅ Байгууллага батлагдлаа." if action == "biz_yes" else "❌ Байгууллагын бүртгэл татгалзагдлаа.")
-async def publish_job_to_channel(context, job):
-    bot_username = (await context.bot.get_me()).username
-    keyboard = InlineKeyboardMarkup([[
-        InlineKeyboardButton("📄 Анкет илгээх", url=f"https://t.me/{bot_username}?start=job_{job['id']}"),
-        InlineKeyboardButton("💬 Premium захиалах", url=f"https://t.me/{PREMIUM_CONTACT}"),
-    ]])
-    message = await context.bot.send_message(
-        CHANNEL_ID,
-        job_text(job),
-        parse_mode=ParseMode.HTML,
-        reply_markup=keyboard,
-    )
-    set_job_channel_message(job["id"], message.message_id)
-
-
-async def job_admin(update, context):
-    q = update.callback_query
-    if q.from_user.id != ADMIN_ID:
-        await q.answer("Админ эрхгүй.", show_alert=True)
+async def show_job(update: Update, context: ContextTypes.DEFAULT_TYPE, job_id: int):
+    job = get_job(job_id, increment_view=True)
+    if not job or job["status"] != "approved":
+        target = update.callback_query.message if update.callback_query else update.message
+        await target.reply_text("Энэ зар идэвхгүй эсвэл олдсонгүй.")
         return
-    action, raw = q.data.split(":")
-    jid = int(raw)
-    before = get_job(jid)
-    if action == "job_free":
-        ok = approve_job(jid, "free")
-    elif action == "job_premium":
-        ok = approve_job(jid, "premium", 1)
-    elif action == "job_vip":
-        ok = approve_job(jid, "vip", 30)
-    else:
-        ok = reject_job(jid)
-    await q.answer("Шийдвэр хадгалагдлаа." if ok else "Өмнө шийдвэрлэсэн.", show_alert=True)
-    await q.edit_message_reply_markup(None)
-    if not ok:
-        return
-    if action == "job_no":
-        await context.bot.send_message(before["employer_id"], "❌ Ажлын зар татгалзагдлаа.")
-        return
-    job = get_job(jid)
-    try:
-        await publish_job_to_channel(context, job)
-    except Exception:
-        logger.exception("Channel нийтлэл амжилтгүй: job_id=%s", jid)
-        await context.bot.send_message(ADMIN_ID, f"⚠️ Зар #{jid}-г {CHANNEL_ID} channel-д нийтэлж чадсангүй. Bot админ эсэхийг шалгана уу.")
-    await context.bot.send_message(job["employer_id"], "✅ Ажлын зар батлагдаж channel-д нийтлэгдлээ.")
-    for row in get_notifiable_users(exclude_id=job["employer_id"]):
-        try:
-            await context.bot.send_message(row["telegram_id"], f"🔔 <b>Шинэ ажлын зар</b>\n\n{job_text(job)}", parse_mode=ParseMode.HTML)
-        except Exception:
-            logger.debug("Мэдэгдэл хүрсэнгүй: %s", row["telegram_id"])
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🤝 Сонирхож байна", callback_data=f"apply:{job_id}"),
+         InlineKeyboardButton("❤️ Хадгалах", callback_data=f"favorite:{job_id}")],
+    ])
+    target = update.callback_query.message if update.callback_query else update.message
+    await target.reply_text(job_text(job), parse_mode=ParseMode.HTML, reply_markup=keyboard)
 
 
-async def user_admin(update, context):
-    q = update.callback_query
-    if q.from_user.id != ADMIN_ID:
-        await q.answer("Админ эрхгүй.", show_alert=True)
-        return
-    action, raw = q.data.split(":")
-    uid = int(raw)
-    if action == "user_free":
-        ok = approve_user(uid, "free")
-    elif action == "user_premium":
-        ok = approve_user(uid, "premium", 24)
-    else:
-        ok = reject_user(uid)
-    await q.answer("Шийдвэр хадгалагдлаа." if ok else "Өмнө шийдвэрлэсэн.", show_alert=True)
-    await q.edit_message_reply_markup(None)
-    if not ok:
-        return
-    if action == "user_no":
-        await context.bot.send_message(uid, "❌ Таны анкет татгалзагдлаа.")
-        return
-    user = get_user(uid)
-    contact_url = f"https://t.me/{user['username']}" if user["username"] else f"tg://user?id={uid}"
-    try:
-        msg = await context.bot.send_message(
-            CHANNEL_ID,
-            user_text(user),
+async def browse_jobs(update, context, job_type: str):
+    rows = list_jobs(job_type=job_type, limit=10)
+    if not rows:
+        await update.message.reply_text("Одоогоор тохирох зар алга.", reply_markup=SEEKER_MENU); return
+    await update.message.reply_text(f"🔎 {len(rows)} зар олдлоо", reply_markup=SEEKER_MENU)
+    for row in rows:
+        await update.message.reply_text(
+            job_text(row), parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("🤝 Сонирхож байна", callback_data=f"apply:{row['id']}"),
+                InlineKeyboardButton("❤️", callback_data=f"favorite:{row['id']}"),
+            ]]),
+        )
+
+
+async def browse_full(update, context): await browse_jobs(update, context, "full_time")
+async def browse_part(update, context): await browse_jobs(update, context, "part_time")
+
+
+async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query; await query.answer(); data = query.data
+    if data.startswith("apply:"):
+        job_id = int(data.split(":")[1]); seeker = get_seeker(query.from_user.id); job = get_job(job_id)
+        if not seeker:
+            await query.message.reply_text("Эхлээд 👤 Миний анкет хэсгээр анкетаа үүсгэнэ үү.", reply_markup=SEEKER_MENU); return
+        if seeker["status"] != "approved":
+            await query.message.reply_text("Таны анкет хараахан батлагдаагүй байна."); return
+        if not job or job["status"] != "approved":
+            await query.message.reply_text("Энэ зар идэвхгүй болсон байна."); return
+        score, reason = match_score(seeker, job)
+        match, created = create_match(job_id, query.from_user.id, score, reason)
+        if not created:
+            await query.message.reply_text("Та энэ зар руу өмнө нь хүсэлт илгээсэн байна."); return
+        await query.message.reply_text(f"✅ Хүсэлт илгээгдлээ.\n\n🤝 Тохирох үнэлгээ: <b>{score}%</b>\n{reason}", parse_mode=ParseMode.HTML)
+        await context.bot.send_message(
+            job["employer_id"],
+            f"🔔 <b>Шинэ хүсэлт</b>\n\n💼 {escape(job['title'])}\n👤 {escape(seeker['full_name'])}\n🧰 {escape(seeker['profession'])}\n🤝 Тохирох үнэлгээ: <b>{score}%</b>\n\n{reason}",
             parse_mode=ParseMode.HTML,
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("💬 Холбогдох", url=contact_url)]]),
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("✅ Зөвшөөрөх", callback_data=f"match_yes:{match['id']}"),
+                InlineKeyboardButton("❌ Татгалзах", callback_data=f"match_no:{match['id']}")
+            ]]),
         )
-        set_user_channel_message(uid, msg.message_id)
-    except Exception:
-        logger.exception("Анкет channel-д нийтлэхэд алдаа гарлаа: %s", uid)
-    await context.bot.send_message(uid, "✅ Таны анкет батлагдаж channel-д нийтлэгдлээ.")
-
-
-async def booking_decision(update, context):
-    q = update.callback_query; action, raw = q.data.split(":"); bid = int(raw); b = get_booking(bid)
-    ok = set_booking_status(bid, q.from_user.id, "approved" if action == "booking_yes" else "rejected")
-    await q.answer("Шийдвэр хадгалагдлаа." if ok else "Өмнө шийдвэрлэсэн.", show_alert=True); await q.edit_message_reply_markup(None)
-    if ok: await context.bot.send_message(b["customer_id"], f"{'✅' if action == 'booking_yes' else '❌'} {b['business_name']} таны {b['requested_time']} цагийн захиалгыг {'баталлаа' if action == 'booking_yes' else 'татгалзлаа'}.")
-async def employer_decision(update, context):
-    q = update.callback_query
-    action, raw = q.data.split(":")
-    mid = int(raw)
-    m = get_match(mid)
-    if not m or q.from_user.id != m["employer_id"]:
-        await q.answer("Эрхгүй.", show_alert=True)
         return
-
-    accepted = action == "emp_yes"
-    ok = set_employer_decision(mid, accepted)
-    await q.answer("Шийдвэр хадгалагдлаа." if ok else "Өмнө шийдвэрлэсэн.", show_alert=True)
-    await q.edit_message_reply_markup(None)
-    if not ok:
-        return
-    if not accepted:
+    if data.startswith("favorite:"):
+        seeker = get_seeker(query.from_user.id)
+        if not seeker:
+            await query.message.reply_text("Эхлээд анкетаа үүсгэнэ үү."); return
+        saved = toggle_favorite(query.from_user.id, int(data.split(":")[1]))
+        await query.answer("Хадгаллаа" if saved else "Хадгалснаас хаслаа", show_alert=True); return
+    if data.startswith("match_yes:") or data.startswith("match_no:"):
+        match_id = int(data.split(":")[1]); match = get_match(match_id)
+        if not match or match["employer_id"] != query.from_user.id:
+            await query.answer("Эрх хүрэхгүй", show_alert=True); return
+        if match["status"] != "waiting_employer":
+            await query.answer("Энэ хүсэлтийг шийдсэн байна", show_alert=True); return
+        if data.startswith("match_no:"):
+            set_match_status(match_id, "rejected")
+            await query.edit_message_reply_markup(None)
+            await context.bot.send_message(match["applicant_id"], f"Таны <b>{escape(match['title'])}</b> ажлын хүсэлт энэ удаад зөвшөөрөгдсөнгүй.", parse_mode=ParseMode.HTML)
+            return
+        set_match_status(match_id, "connected")
+        await query.edit_message_reply_markup(None)
         await context.bot.send_message(
-            m["applicant_id"],
-            "ℹ️ Ажил олгогч Match хүсэлтийг үргэлжлүүлээгүй.",
+            match["applicant_id"],
+            f"🎉 <b>Match боллоо!</b>\n\n🏢 {escape(match['company'])}\n💼 {escape(match['title'])}\n☎️ {escape(match['employer_phone'])}",
+            parse_mode=ParseMode.HTML,
+        )
+        await context.bot.send_message(
+            match["employer_id"],
+            f"🎉 <b>Match боллоо!</b>\n\n👤 {escape(match['full_name'])}\n🧰 {escape(match['profession'])}\n☎️ {escape(match['applicant_phone'])}",
+            parse_mode=ParseMode.HTML,
         )
         return
+    if data.startswith("close_job:"):
+        job_id = int(data.split(":")[1])
+        if close_job(job_id, query.from_user.id):
+            await query.edit_message_reply_markup(None)
+            await query.message.reply_text("⛔ Зар хаагдлаа.", reply_markup=EMPLOYER_MENU)
+        else:
+            await query.answer("Зар хаах эрхгүй эсвэл зар олдсонгүй", show_alert=True)
+        return
+    if data.startswith("admin_"):
+        if query.from_user.id != ADMIN_ID:
+            await query.answer("Админы эрх шаардлагатай", show_alert=True); return
+        action, raw_id = data.rsplit(":", 1); item_id = int(raw_id)
+        if action == "admin_seeker_yes":
+            set_seeker_status(item_id, "approved"); await context.bot.send_message(item_id, "✅ Таны анкет батлагдлаа.", reply_markup=SEEKER_MENU)
+        elif action == "admin_seeker_no":
+            set_seeker_status(item_id, "rejected"); await context.bot.send_message(item_id, "❌ Таны анкет батлагдсангүй. Мэдээллээ засаж дахин илгээнэ үү.")
+        elif action == "admin_business_yes":
+            set_business_status(item_id, "approved", True); b = get_business(item_id); await context.bot.send_message(b["owner_id"], "✅ Байгууллага баталгаажлаа.", reply_markup=EMPLOYER_MENU)
+        elif action == "admin_business_no":
+            set_business_status(item_id, "rejected"); b = get_business(item_id); await context.bot.send_message(b["owner_id"], "❌ Байгууллагын бүртгэл батлагдсангүй.")
+        elif action.startswith("admin_job_"):
+            job = get_job(item_id)
+            if action == "admin_job_no":
+                set_job_status(item_id, "rejected"); await context.bot.send_message(job["employer_id"], "❌ Таны зар батлагдсангүй.")
+            else:
+                plan = action.removeprefix("admin_job_")
+                expiry = None
+                if plan == "premium": expiry = expires_after(hours=24)
+                if plan == "vip": expiry = expires_after(days=30)
+                set_job_status(item_id, "approved"); set_job_plan(item_id, plan, expiry)
+                job = get_job(item_id)
+                await context.bot.send_message(job["employer_id"], f"✅ Таны зар батлагдлаа. Төлөв: {plan.upper()}", reply_markup=EMPLOYER_MENU)
+                if CHANNEL_ID:
+                    me = await context.bot.get_me()
+                    sent = await context.bot.send_message(
+                        CHANNEL_ID, job_text(job), parse_mode=ParseMode.HTML,
+                        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🤝 Сонирхож байна", url=f"https://t.me/{me.username}?start=job_{item_id}")]]),
+                    )
+                    set_job_channel_message(item_id, sent.message_id)
+        await query.edit_message_reply_markup(None)
+        await query.answer("Хадгаллаа", show_alert=True)
 
-    applicant_username = f"@{m['applicant_username']}" if m["applicant_username"] else "байхгүй"
-    employer_username = f"@{m['employer_username']}" if m["employer_username"] else "байхгүй"
 
-    await context.bot.send_message(
-        m["employer_id"],
-        "🎉 <b>MATCH АМЖИЛТТАЙ</b>\n\n"
-        f"👤 {escape(m['full_name'])}\n"
-        f"☎️ {escape(m['phone'])}\n"
-        f"💬 Telegram: {escape(applicant_username)}\n"
-        f"🧰 {escape(m['profession'] or '-')}\n"
-        f"📚 {escape(m['experience'] or '-')}",
+async def profile(update, context):
+    row = get_seeker(update.effective_user.id)
+    if not row:
+        await update.message.reply_text("Анкет байхгүй. Доорх асуултаар хурдан үүсгэнэ үү."); return await seeker_start(update, context)
+    await update.message.reply_text(seeker_text(row), parse_mode=ParseMode.HTML, reply_markup=SEEKER_MENU)
+
+
+async def seeker_dashboard(update, context):
+    c = dashboard_counts(update.effective_user.id, "seeker")
+    await update.message.reply_text(f"📊 <b>Миний самбар</b>\n\n⏳ Хариу хүлээж буй: {c['waiting']}\n🎉 Match болсон: {c['connected']}\n❤️ Хадгалсан: {c['favorites']}", parse_mode=ParseMode.HTML, reply_markup=SEEKER_MENU)
+
+
+async def employer_dashboard(update, context):
+    c = dashboard_counts(update.effective_user.id, "employer")
+    await update.message.reply_text(f"📊 <b>Миний самбар</b>\n\n📢 Идэвхтэй зар: {c['jobs']}\n📨 Шинэ хүсэлт: {c['waiting']}\n🎉 Match болсон: {c['connected']}", parse_mode=ParseMode.HTML, reply_markup=EMPLOYER_MENU)
+
+
+async def favorites(update, context):
+    rows = list_favorites(update.effective_user.id)
+    if not rows: await update.message.reply_text("Хадгалсан зар алга.", reply_markup=SEEKER_MENU); return
+    for row in rows: await update.message.reply_text(job_text(row), parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🤝 Сонирхож байна", callback_data=f"apply:{row['id']}")]]))
+
+
+async def my_jobs(update, context):
+    rows = list_employer_jobs(update.effective_user.id)
+    if not rows: await update.message.reply_text("Таны зар алга.", reply_markup=EMPLOYER_MENU); return
+    for row in rows:
+        status = {"approved":"🟢 Идэвхтэй", "pending":"🟡 Хүлээгдэж буй", "closed":"⚫ Хаагдсан", "rejected":"🔴 Татгалзсан"}.get(row["status"], row["status"])
+        await update.message.reply_text(f"💼 <b>{escape(row['title'])}</b>\n{status}\n📨 Хүсэлт: {row['application_count']}\n👀 Үзэлт: {row['views']}", parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⛔ Зар хаах", callback_data=f"close_job:{row['id']}")]]))
+
+
+async def incoming(update, context):
+    rows = list_employer_matches(update.effective_user.id, "waiting_employer")
+    if not rows: await update.message.reply_text("Шинэ хүсэлт алга.", reply_markup=EMPLOYER_MENU); return
+    for row in rows:
+        await update.message.reply_text(f"📨 <b>{escape(row['title'])}</b>\n👤 {escape(row['full_name'])}\n🧰 {escape(row['profession'])}\n🤝 {row['score']}%", parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✅ Зөвшөөрөх", callback_data=f"match_yes:{row['id']}"), InlineKeyboardButton("❌ Татгалзах", callback_data=f"match_no:{row['id']}")]]))
+
+
+async def vip_info(update, context):
+    await update.message.reply_text(
+        "👑 <b>VIP ЗАР — 35,000₮ / 30 хоног</b>\n\n✅ Жагсаалтын эхэнд\n✅ VIP тэмдэг, онцгой дизайн\n✅ Match саналд давуу эрэмбэ\n✅ Channel-д онцлон нийтлэх\n✅ Үзэлт ба хүсэлтийн статистик\n\nТөлбөр болон идэвхжүүлэлт:",
         parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("💬 Админтай холбогдох", url=f"https://t.me/{PREMIUM_CONTACT}")]]),
     )
-    await context.bot.send_message(
-        m["applicant_id"],
-        "🎉 <b>MATCH АМЖИЛТТАЙ</b>\n\n"
-        f"🏢 {escape(m['company'])}\n"
-        f"💼 {escape(m['title'])}\n"
-        f"💬 Ажил олгогчийн Telegram: {escape(employer_username)}",
-        parse_mode=ParseMode.HTML,
-    )
-    if ADMIN_ID:
-        await context.bot.send_message(
-            ADMIN_ID,
-            f"✅ Match #{mid}: хоёр тал холбогдлоо.",
-        )
-
-
-async def my_services(update, context):
-    b = get_business_by_owner(update.effective_user.id)
-    if not b: await update.message.reply_text("Байгууллага олдсонгүй.", reply_markup=BUSINESS_MENU); return
-    services = get_services_by_business(b["id"])
-    if not services: await update.message.reply_text("Үйлчилгээ бүртгээгүй байна.", reply_markup=BUSINESS_MENU); return
-    for s0 in services: await update.message.reply_text(service_text(get_service(s0["id"])), parse_mode=ParseMode.HTML)
 
 
 async def admin_stats(update, context):
     if update.effective_user.id != ADMIN_ID: return
-    d = stats(); await update.message.reply_text("📊 ServiGo статистик\n\n" + "\n".join([
-        f"👥 Хэрэглэгч: {d['users']}", f"🏢 Байгууллага: {d['businesses']}", f"✅ Батлагдсан: {d['approved_businesses']}",
-        f"🛍 Үйлчилгээ: {d['services']}", f"📅 Захиалга: {d['bookings']}", f"💼 Ажлын зар: {d['jobs']}",
-        f"⏰ Цагийн ажил: {d['part_time_jobs']}", f"🤝 Match: {d['matches']}"
-    ]))
-
-
-async def premium_info(update, context):
-    await update.message.reply_text(
-        "⭐ <b>ServiGo Premium үйлчилгээ</b>\n\n"
-        "🏢 Байгууллагын Premium зар\n⏰ 24 цаг — <b>5,000₮</b>\n\n"
-        "👑 VIP зар\n📅 30 хоног — <b>35,000₮</b>\n\n"
-        "👤 Ажил хайгчийн Premium анкет\n⏰ 24 цаг — <b>3,000₮</b>\n\n"
-        "Төлбөр болон идэвхжүүлэлт: @bayanburd",
-        parse_mode=ParseMode.HTML,
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("💬 @bayanburd", url=f"https://t.me/{PREMIUM_CONTACT}")]]),
-    )
-
-
-async def notification_toggle(update, context):
-    user = get_user(update.effective_user.id)
-    if not user:
-        await update.message.reply_text("Эхлээд анкетаа бөглөнө үү.", reply_markup=MAIN_MENU)
-        return
-    enabled = toggle_notifications(update.effective_user.id)
-    await update.message.reply_text("🔔 Мэдэгдэл асаалаа." if enabled else "🔕 Мэдэгдэл унтраалаа.", reply_markup=MAIN_MENU)
-
-
-async def refresh_promoted_posts(application):
-    while True:
-        await asyncio.sleep(300)
-        expire_promotions()
-        bot_username = (await application.bot.get_me()).username
-        for job in get_promoted_jobs():
-            try:
-                await application.bot.edit_message_text(
-                    chat_id=CHANNEL_ID,
-                    message_id=job["channel_message_id"],
-                    text=job_text(job),
-                    parse_mode=ParseMode.HTML,
-                    reply_markup=InlineKeyboardMarkup([[
-                        InlineKeyboardButton("📄 Анкет илгээх", url=f"https://t.me/{bot_username}?start=job_{job['id']}"),
-                        InlineKeyboardButton("💬 Premium захиалах", url=f"https://t.me/{PREMIUM_CONTACT}"),
-                    ]]),
-                )
-            except Exception as exc:
-                if "message is not modified" not in str(exc).lower():
-                    logger.warning("Зарын цаг шинэчилж чадсангүй: %s", job["id"], exc_info=True)
-        for user in get_promoted_users():
-            try:
-                contact_url = f"https://t.me/{user['username']}" if user["username"] else f"tg://user?id={user['telegram_id']}"
-                await application.bot.edit_message_text(
-                    chat_id=CHANNEL_ID,
-                    message_id=user["channel_message_id"],
-                    text=user_text(user),
-                    parse_mode=ParseMode.HTML,
-                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("💬 Холбогдох", url=contact_url)]]),
-                )
-            except Exception as exc:
-                if "message is not modified" not in str(exc).lower():
-                    logger.warning("Анкетын цаг шинэчилж чадсангүй: %s", user["telegram_id"], exc_info=True)
-
-
-async def post_init(application):
-    expire_promotions()
-    application.create_task(refresh_promoted_posts(application))
-
-
-async def help_message(update, context):
-    await update.message.reply_text("ServiGo дээр та:\n• Үйлчилгээ хайж цаг захиална\n• Байнгын болон цагийн ажил хайна\n• Байгууллага бүртгэж үйлчилгээ, ажлын зар байршуулна\n• Match амжилттай бол холбоо нээгдэнэ")
+    s = stats(); await update.message.reply_text("📊 <b>ServiGo статистик</b>\n\n" + "\n".join(f"{k}: {v}" for k,v in s.items()), parse_mode=ParseMode.HTML)
 
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
-    logger.exception("Update боловсруулах үед алдаа гарлаа", exc_info=context.error)
+    logger.exception("Unhandled error", exc_info=context.error)
     if isinstance(update, Update) and update.effective_message:
-        try:
-            await update.effective_message.reply_text("⚠️ Түр алдаа гарлаа. Дахин оролдоно уу.")
-        except Exception:
-            logger.debug("Алдааны мэдэгдэл илгээж чадсангүй", exc_info=True)
+        try: await update.effective_message.reply_text("Түр алдаа гарлаа. Дахин оролдоно уу.")
+        except Exception: logger.exception("Could not notify user")
 
 
-def main():
-    init_db(); app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
-    app.add_handler(CommandHandler("start", start)); app.add_handler(CommandHandler("cancel", cancel)); app.add_handler(CommandHandler("stats", admin_stats))
+def build_app() -> Application:
+    validate_config()
+    app = Application.builder().token(BOT_TOKEN).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("stats", admin_stats))
+    app.add_handler(ConversationHandler(
+        entry_points=[MessageHandler(filters.Regex(r"^👤 Миний анкет$"), profile)],
+        states={
+            S_NAME:[MessageHandler(TEXT_INPUT, seeker_name)],
+            S_PROFESSION:[MessageHandler(TEXT_INPUT, seeker_profession)],
+            S_LOCATION:[MessageHandler(TEXT_INPUT, seeker_location)],
+            S_SALARY:[MessageHandler(TEXT_INPUT, seeker_salary)],
+            S_PHONE:[MessageHandler(PHONE_INPUT, seeker_phone)],
+            S_EXPERIENCE:[MessageHandler(TEXT_INPUT, seeker_experience)],
+        }, fallbacks=[MessageHandler(filters.Regex(r"^❌ Цуцлах$"), cancel)], allow_reentry=True,
+    ))
+    app.add_handler(ConversationHandler(
+        entry_points=[MessageHandler(filters.Regex(r"^🏢 Байгууллага бүртгэх$"), business_start)],
+        states={B_NAME:[MessageHandler(TEXT_INPUT, business_name)], B_PHONE:[MessageHandler(PHONE_INPUT, business_phone)], B_LOCATION:[MessageHandler(TEXT_INPUT, business_location)]},
+        fallbacks=[MessageHandler(filters.Regex(r"^❌ Цуцлах$"), cancel)], allow_reentry=True,
+    ))
+    app.add_handler(ConversationHandler(
+        entry_points=[MessageHandler(filters.Regex(r"^➕ Байнгын ажлын зар$"), job_start_full), MessageHandler(filters.Regex(r"^➕ Цагийн ажлын зар$"), job_start_part)],
+        states={J_TITLE:[MessageHandler(TEXT_INPUT, job_title)], J_CATEGORY:[MessageHandler(TEXT_INPUT, job_category)], J_SALARY:[MessageHandler(TEXT_INPUT, job_salary)], J_LOCATION:[MessageHandler(TEXT_INPUT, job_location)], J_SCHEDULE:[MessageHandler(TEXT_INPUT, job_schedule)], J_REQUIREMENTS:[MessageHandler(TEXT_INPUT, job_requirements)]},
+        fallbacks=[MessageHandler(filters.Regex(r"^❌ Цуцлах$"), cancel)], allow_reentry=True,
+    ))
+    app.add_handler(CallbackQueryHandler(callbacks))
+    app.add_handler(MessageHandler(filters.Regex(r"^👤 Ажил хайгч$"), choose_seeker))
+    app.add_handler(MessageHandler(filters.Regex(r"^🏢 Ажил олгогч$"), choose_employer))
+    app.add_handler(MessageHandler(filters.Regex(r"^🔄 Горим солих$"), start))
+    app.add_handler(MessageHandler(filters.Regex(r"^💼 Байнгын ажил$"), browse_full))
+    app.add_handler(MessageHandler(filters.Regex(r"^⏰ Цагийн ажил$"), browse_part))
+    app.add_handler(MessageHandler(filters.Regex(r"^📊 Миний самбар$"), lambda u,c: employer_dashboard(u,c) if c.user_data.get("role") == "employer" else seeker_dashboard(u,c)))
+    app.add_handler(MessageHandler(filters.Regex(r"^❤️ Хадгалсан$"), favorites))
+    app.add_handler(MessageHandler(filters.Regex(r"^📋 Миний зарууд$"), my_jobs))
+    app.add_handler(MessageHandler(filters.Regex(r"^📨 Ирсэн хүсэлтүүд$"), incoming))
+    app.add_handler(MessageHandler(filters.Regex(r"^⭐ VIP зар$"), vip_info))
+    app.add_error_handler(error_handler)
+    return app
 
-    app.add_handler(ConversationHandler(entry_points=[MessageHandler(filters.Regex("^👤 Миний анкет$"), profile_start)], states={P_NAME:[MessageHandler(filters.TEXT & ~filters.COMMAND,p_name)],P_PHONE:[MessageHandler(filters.TEXT & ~filters.COMMAND,p_phone)],P_PROFESSION:[MessageHandler(filters.TEXT & ~filters.COMMAND,p_prof)],P_EXPERIENCE:[MessageHandler(filters.TEXT & ~filters.COMMAND,p_exp)],P_SALARY:[MessageHandler(filters.TEXT & ~filters.COMMAND,p_salary)]}, fallbacks=[CommandHandler("cancel",cancel)]))
-    app.add_handler(ConversationHandler(entry_points=[MessageHandler(filters.Regex("^🏢 Байгууллага бүртгэх$"), business_start)], states={B_NAME:[MessageHandler(filters.TEXT & ~filters.COMMAND,b_name)],B_CATEGORY:[MessageHandler(filters.TEXT & ~filters.COMMAND,b_cat)],B_PHONE:[MessageHandler(filters.TEXT & ~filters.COMMAND,b_phone)],B_LOCATION:[MessageHandler(filters.TEXT & ~filters.COMMAND,b_location)],B_DESCRIPTION:[MessageHandler(filters.TEXT & ~filters.COMMAND,b_desc)]}, fallbacks=[CommandHandler("cancel",cancel)]))
-    app.add_handler(ConversationHandler(entry_points=[MessageHandler(filters.Regex("^➕ Үйлчилгээ нэмэх$"), service_start)], states={S_TITLE:[MessageHandler(filters.TEXT & ~filters.COMMAND,s_title)],S_PRICE:[MessageHandler(filters.TEXT & ~filters.COMMAND,s_price)],S_DURATION:[MessageHandler(filters.TEXT & ~filters.COMMAND,s_duration)],S_DESCRIPTION:[MessageHandler(filters.TEXT & ~filters.COMMAND,s_desc)]}, fallbacks=[CommandHandler("cancel",cancel)]))
-    app.add_handler(ConversationHandler(entry_points=[MessageHandler(filters.Regex("^📢 Байнгын ажилтан хайх$"), job_start_full), MessageHandler(filters.Regex("^⏰ Цагийн ажилтан хайх$"), job_start_part)], states={J_TITLE:[MessageHandler(filters.TEXT & ~filters.COMMAND,j_title)],J_TYPE:[MessageHandler(filters.TEXT & ~filters.COMMAND,j_type)],J_CATEGORY:[MessageHandler(filters.TEXT & ~filters.COMMAND,j_cat)],J_SALARY:[MessageHandler(filters.TEXT & ~filters.COMMAND,j_salary)],J_SCHEDULE:[MessageHandler(filters.TEXT & ~filters.COMMAND,j_schedule)],J_LOCATION:[MessageHandler(filters.TEXT & ~filters.COMMAND,j_location)],J_DESCRIPTION:[MessageHandler(filters.TEXT & ~filters.COMMAND,j_desc)]}, fallbacks=[CommandHandler("cancel",cancel)]))
-    app.add_handler(ConversationHandler(entry_points=[CallbackQueryHandler(book_callback, pattern=r"^book:\d+$")], states={BK_TIME:[MessageHandler(filters.TEXT & ~filters.COMMAND,bk_time)],BK_NOTE:[MessageHandler(filters.TEXT & ~filters.COMMAND,bk_note)]}, fallbacks=[CommandHandler("cancel",cancel)], per_message=False))
 
-    app.add_handler(MessageHandler(filters.Regex("^🏢 Байгууллагын хэсэг$"), business_menu)); app.add_handler(MessageHandler(filters.Regex("^⭐ Premium үйлчилгээ$"), premium_info)); app.add_handler(MessageHandler(filters.Regex("^🔔 Мэдэгдэл$"), notification_toggle)); app.add_handler(MessageHandler(filters.Regex("^🔎 Үйлчилгээ хайх$"), browse_services)); app.add_handler(MessageHandler(filters.Regex("^💼 Байнгын ажил$"), browse_full)); app.add_handler(MessageHandler(filters.Regex("^⏰ Цагийн ажил$"), browse_part)); app.add_handler(MessageHandler(filters.Regex("^📋 Миний үйлчилгээ$"), my_services)); app.add_handler(MessageHandler(filters.Regex("^🔙 Үндсэн цэс$"), start)); app.add_handler(MessageHandler(filters.Regex("^ℹ️ Тусламж$"), help_message))
-    all_categories = sorted(set(SERVICE_CATEGORIES + JOB_CATEGORIES))
-    app.add_handler(MessageHandler(filters.Regex("^(" + "|".join(map(re.escape, all_categories)) + ")$"), category_router))
-
-    app.add_handler(CallbackQueryHandler(match_callback, pattern=r"^match:\d+$")); app.add_handler(CallbackQueryHandler(interest_callback, pattern=r"^interest:\d+$")); app.add_handler(CallbackQueryHandler(business_admin, pattern=r"^biz_(yes|no):\d+$")); app.add_handler(CallbackQueryHandler(job_admin, pattern=r"^job_(free|premium|vip|no):\d+$")); app.add_handler(CallbackQueryHandler(user_admin, pattern=r"^user_(free|premium|no):\d+$")); app.add_handler(CallbackQueryHandler(booking_decision, pattern=r"^booking_(yes|no):\d+$")); app.add_handler(CallbackQueryHandler(employer_decision, pattern=r"^emp_(yes|no):\d+$"))
-
-    print("ServiGo bot ажиллаж эхэллээ..."); app.run_polling(drop_pending_updates=True)
-
-
-if __name__ == "__main__": main()
+if __name__ == "__main__":
+    validate_config()
+    init_db()
+    logger.info("ServiGo started")
+    build_app().run_polling(drop_pending_updates=True)
