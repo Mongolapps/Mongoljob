@@ -27,6 +27,7 @@ logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO").upper(),
 )
 logger = logging.getLogger("servigo")
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0") or 0)
